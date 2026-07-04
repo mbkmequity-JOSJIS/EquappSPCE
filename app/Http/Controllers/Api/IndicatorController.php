@@ -3,16 +3,13 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Services\FirebaseService;
+use App\Services\DeviceDataService;
 use Illuminate\Http\JsonResponse;
 
 class IndicatorController extends Controller
 {
-    protected FirebaseService $firebaseService;
-
-    public function __construct(FirebaseService $firebaseService)
+    public function __construct(protected DeviceDataService $deviceDataService)
     {
-        $this->firebaseService = $firebaseService;
     }
 
     /**
@@ -21,7 +18,8 @@ class IndicatorController extends Controller
     public function aquaviska($area = 'Area-1'): JsonResponse
     {
         try {
-            $indicators = $this->firebaseService->getAquaviskaIndicators($area);
+            $devices = $this->deviceDataService->getDevicesByModule('aquaviska');
+            $indicators = $this->buildIndicators($devices, $area);
             
             return response()->json([
                 'success' => true,
@@ -43,17 +41,9 @@ class IndicatorController extends Controller
     public function location($locationId): JsonResponse
     {
         try {
-            // Map location ID to Firebase area
-            // For now, all locations use Area-1
-            // In future, you can expand this mapping
-            $areaMapping = [
-                1 => 'Area-1',
-                2 => 'Area-1', // Placeholder
-                3 => 'Area-1', // Placeholder
-            ];
-
-            $area = $areaMapping[$locationId] ?? 'Area-1';
-            $indicators = $this->firebaseService->getAquaviskaIndicators($area);
+            $devices = $this->deviceDataService->getDevicesByModule('aquaviska');
+            $device = collect($devices)->values()->get(max(0, (int) $locationId - 1));
+            $indicators = $device ? [$device] : [];
 
             return response()->json([
                 'success' => true,
@@ -74,15 +64,9 @@ class IndicatorController extends Controller
     public function iotClimate($locationId = 1): JsonResponse
     {
         try {
-            // Map location ID to device ID
-            $deviceMapping = [
-                1 => 'device_1',
-                2 => 'device_1', // Can be changed later
-                3 => 'device_1', // Can be changed later
-            ];
-
-            $deviceId = $deviceMapping[$locationId] ?? 'device_1';
-            $indicators = $this->firebaseService->getIotClimateIndicators($deviceId);
+            $devices = $this->deviceDataService->getDevicesByModule('climeet');
+            $device = collect($devices)->values()->get(max(0, (int) $locationId - 1));
+            $indicators = $device ? [$device] : [];
 
             return response()->json([
                 'success' => true,
@@ -95,5 +79,32 @@ class IndicatorController extends Controller
                 'message' => $e->getMessage(),
             ], 500);
         }
+    }
+
+    private function buildIndicators(array $devices, string $area): array
+    {
+        $filteredDevices = array_values(array_filter($devices, function (array $device) use ($area) {
+            if ($area === 'Area-1') {
+                return true;
+            }
+
+            $city = strtolower((string) data_get($device, 'location.city', ''));
+            $deviceCode = strtolower((string) ($device['device_code'] ?? ''));
+
+            return $city === strtolower($area) || $deviceCode === strtolower($area);
+        }));
+
+        return array_map(function (array $device) {
+            return [
+                'device_code' => $device['device_code'] ?? '',
+                'device_name' => $device['device_name'] ?? '',
+                'location' => $device['location'] ?? [],
+                'status' => $device['status'] ?? 'offline',
+                'condition_score' => $device['condition_score'] ?? 0,
+                'recommendation' => $device['recommendation'] ?? '',
+                'sensors' => $device['sensors'] ?? [],
+                'latest_data' => $device['latest_data'] ?? [],
+            ];
+        }, $filteredDevices);
     }
 }

@@ -4,18 +4,16 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
-use App\Services\FirebaseService;
+use Illuminate\Support\Facades\Log;
+use App\Services\DeviceDataService;
 use App\Services\GroqAIService;
 
 class DeviceController extends Controller
 {
-    protected FirebaseService $firebaseService;
-    protected GroqAIService $aiService;
-
-    public function __construct()
-    {
-        $this->firebaseService = new FirebaseService();
-        $this->aiService = new GroqAIService();
+    public function __construct(
+        protected DeviceDataService $deviceDataService,
+        protected GroqAIService $aiService,
+    ) {
     }
 
     public function index()
@@ -25,28 +23,14 @@ class DeviceController extends Controller
 
     public function devices($device)
     {
-        if ($device == 'aquaviska') {
-            $dataDevices = $this->firebaseService->getDeviceData('aquaviska');
-        } else if ($device == 'climeet') {
-            $dataDevices = $this->firebaseService->getDeviceData('climeet');
-        } else {
+        if (!in_array($device, ['aquaviska', 'climeet'], true)) {
             abort(404);
         }
 
-        // Filter: only show approved (is_preview = true) and not deleted
-        $filtered = [];
-        if (is_array($dataDevices)) {
-            foreach($dataDevices as $key => $d) {
-                $isPreview = isset($d['is_preview']) && ($d['is_preview'] === true || $d['is_preview'] === 'true');
-                $isDeleted = isset($d['is_deleted']) && ($d['is_deleted'] === true || $d['is_deleted'] === 'true');
-                
-                if ($isPreview && !$isDeleted) {
-                    $d['node'] = $key;
-                    $filtered[$key] = $d;
-                }
-            }
-        }
-        $dataDevices = $filtered;
+        $dataDevices = array_filter(
+            $this->deviceDataService->getDevicesByModule($device),
+            fn (array $data) => ($data['is_preview'] ?? false) && !($data['is_deleted'] ?? false)
+        );
 
         return view('devices.device-list', compact('dataDevices', 'device'));
     }
@@ -67,7 +51,7 @@ class DeviceController extends Controller
             ];
             // dd($deviceDataMonitoring['ai_recommendations']);
         } catch (\Exception $e) {
-            \Log::error('AI Recommendation error: ' . $e->getMessage());
+            Log::error('AI Recommendation error: ' . $e->getMessage());
             $deviceDataMonitoring['ai_recommendations'] = [
                 'summary' => 'AI tidak tersedia saat ini',
                 'recommendations' => [],
@@ -92,7 +76,7 @@ class DeviceController extends Controller
         try {
             $aiRecommendations = $this->aiService->generateRecommendations($deviceDataInfo, $deviceDataMonitoring);
         } catch (\Exception $e) {
-            \Log::error('AI Recommendation API error: ' . $e->getMessage());
+            Log::error('AI Recommendation API error: ' . $e->getMessage());
             $aiRecommendations = [
                 'summary' => 'AI tidak tersedia',
                 'recommendations' => [],
@@ -131,18 +115,16 @@ class DeviceController extends Controller
         ]);
 
         try {
-            $this->firebaseService->setCalibration($device, $device_code, [
-                'sensor_type' => $calibrationData['sensor_type'],
-                'current_value' => $calibrationData['current_value'] ?? null,
-                'reference_value' => (float) $calibrationData['reference_value'],
-                'offset_value' => isset($calibrationData['offset_value']) ? (float) $calibrationData['offset_value'] : null,
-                'notes' => $calibrationData['notes'] ?? null,
-                'calibrated_at' => now()->toIso8601String(),
-            ]);
+            $this->deviceDataService->storeCalibration(
+                $device,
+                $device_code,
+                $calibrationData,
+                session('firebase_user.email') ?? null
+            );
 
             return response()->json([
                 'success' => true,
-                'message' => 'Data kalibrasi berhasil dikirim ke Firebase.',
+                'message' => 'Data kalibrasi berhasil disimpan ke database.',
             ]);
         } catch (\Exception $e) {
             return response()->json([
@@ -155,22 +137,21 @@ class DeviceController extends Controller
 
     private function resolveDeviceDetail($device, $device_code): array
     {
-        if ($device == 'aquaviska') {
-            $deviceDataInfo = $this->firebaseService->getDeviceData('aquaviska');
-            $deviceDataMonitoring = $this->firebaseService->getDataAquaviskaByDeviceCode($device_code);
-        } else if ($device == 'climeet') {
-            $deviceDataInfo = $this->firebaseService->getDeviceData('climeet');
-            $deviceDataMonitoring = $this->firebaseService->getDataClimeetByDeviceCode($device_code);
-        } else {
+        if (!in_array($device, ['aquaviska', 'climeet'], true)) {
             abort(404);
         }
 
-        $deviceDataInfo = collect($deviceDataInfo)->firstWhere('device_code', $device_code) ?? [];
-        $deviceDataMonitoring = $this->prepareDeviceMonitoring($deviceDataMonitoring);
+        $deviceDataInfo = $this->deviceDataService->getDeviceByCode($device, $device_code);
+        if (empty($deviceDataInfo)) {
+            return [[], []];
+        }
+
+        $latestReading = $this->deviceDataService->getLatestReading($device, $device_code);
+        $deviceDataMonitoring = $this->prepareDeviceMonitoring(['latest' => $latestReading]);
         $deviceDataMonitoring['type'] = $deviceDataInfo['type'] ?? ($device === 'aquaviska' ? 'AQUAVISKA' : 'CLIMEET');
 
         // Ambil data history untuk chart
-        $deviceHistory = $this->firebaseService->getHistoryData($device, $device_code, $device);
+        $deviceHistory = $this->deviceDataService->getHistory($device, $device_code);
         $deviceDataMonitoring['chart'] = $this->buildHistoryChartSeries($deviceHistory, $deviceDataMonitoring['type']);
 
         return [$deviceDataInfo, $deviceDataMonitoring];
@@ -178,11 +159,15 @@ class DeviceController extends Controller
 
     private function prepareDeviceMonitoring(array $deviceDataMonitoring): array
     {
-        $latest = $deviceDataMonitoring['latest'] ?? [];
+        $latest = $deviceDataMonitoring['latest'] ?? $deviceDataMonitoring;
         $sensors = [];
 
         foreach ($latest as $sensor => $value) {
-            if ($sensor === 'timestamp' || $sensor === 'condition_score' || $sensor === 'status') {
+            if (in_array($sensor, ['timestamp', 'recorded_at', 'created_at', 'updated_at', 'condition_score', 'status', 'device_code'], true)) {
+                continue;
+            }
+
+            if (!is_numeric($value)) {
                 continue;
             }
 
@@ -223,7 +208,8 @@ class DeviceController extends Controller
             str_contains($sensorLower, 'co2') || str_contains($sensorLower, 'co₂') => 'ppm',
             str_contains($sensorLower, 'uv') => 'index',
             str_contains($sensorLower, 'angin') => 'm/s',
-            str_contains($sensorLower, 'curah') => 'mm',
+            str_contains($sensorLower, 'hujan') || str_contains($sensorLower, 'curah') => 'mm',
+            str_contains($sensorLower, 'tekanan') => 'hPa',
             default => '',
         };
     }
@@ -243,6 +229,9 @@ class DeviceController extends Controller
             str_contains($sensorLower, 'tds') => (int) round(min(max(($value / 1500) * 100, 0), 100)),
             str_contains($sensorLower, 'turbidity') => (int) round(min(max(($value / 100) * 100, 0), 100)),
             str_contains($sensorLower, 'humidity') => (int) round(min(max($value, 0), 100)),
+            str_contains($sensorLower, 'angin') => (int) round(min(max(($value / 30) * 100, 0), 100)),
+            str_contains($sensorLower, 'hujan') || str_contains($sensorLower, 'curah') => (int) round(min(max(($value / 150) * 100, 0), 100)),
+            str_contains($sensorLower, 'tekanan') => (int) round(min(max((($value - 900) / 150) * 100, 0), 100)),
             default => (int) round(min(max($value, 0), 100)),
         };
     }
@@ -416,6 +405,21 @@ class DeviceController extends Controller
                 $value > 75 => 'waspada',
                 default => 'normal'
             },
+            str_contains($sensorLower, 'angin') => match (true) {
+                $value > 25 => 'bahaya',
+                $value > 15 => 'waspada',
+                default => 'normal'
+            },
+            str_contains($sensorLower, 'hujan') || str_contains($sensorLower, 'curah') => match (true) {
+                $value > 100 => 'bahaya',
+                $value > 50 => 'waspada',
+                default => 'normal'
+            },
+            str_contains($sensorLower, 'tekanan') => match (true) {
+                $value < 980 || $value > 1035 => 'bahaya',
+                $value < 990 || $value > 1028 => 'waspada',
+                default => 'normal'
+            },
             str_contains($sensorLower, 'uv') => match (true) {
                 $value > 10 => 'bahaya',
                 $value > 7 => 'waspada',
@@ -461,7 +465,8 @@ class DeviceController extends Controller
             str_contains($sensorLower, 'co2') || str_contains($sensorLower, 'co₂') => 'CO₂',
             str_contains($sensorLower, 'uv') => 'UV Index',
             str_contains($sensorLower, 'angin') => 'Wind Speed',
-            str_contains($sensorLower, 'curah') => 'Rainfall',
+            str_contains($sensorLower, 'hujan') || str_contains($sensorLower, 'curah') => 'Rainfall',
+            str_contains($sensorLower, 'tekanan') => 'Pressure',
             default => ucfirst($sensor)
         };
     }
@@ -469,23 +474,17 @@ class DeviceController extends Controller
     public function getHistory($device, $device_code): JsonResponse
     {
         try {
-            if ($device == 'aquaviska') {
-                $dataHistory = $this->firebaseService->getHistoryData('aquaviska', $device_code, 'aquaviska');
-            } else if ($device == 'climeet') {
-                $dataHistory = $this->firebaseService->getHistoryData('climeet', $device_code, 'climeet');
-            } else {
+            if (!in_array($device, ['aquaviska', 'climeet'], true)) {
                 abort(404);
             }
 
+            $dataHistory = $this->deviceDataService->getHistory($device, $device_code);
+
             $formattedHistory = $this->buildHistoryChartSeries($dataHistory, $device);
 
-            if ($device == 'aquaviska') {
-                $latestData = $this->firebaseService->getDataAquaviskaByDeviceCode($device_code);
-            } else {
-                $latestData = $this->firebaseService->getDataClimeetByDeviceCode($device_code);
-            }
+            $latestData = $this->deviceDataService->getLatestReading($device, $device_code);
 
-            $latestSensors = $this->prepareDeviceMonitoring($latestData)['sensors'] ?? [];
+            $latestSensors = $this->prepareDeviceMonitoring(['latest' => $latestData])['sensors'] ?? [];
 
             return response()->json([
                 'success' => true,

@@ -2,16 +2,12 @@
 
 namespace App\Http\Controllers;
 
-use Illuminate\Http\Request;
-use App\Services\FirebaseService;
+use App\Services\DeviceDataService;
 
 class DashboardController extends Controller
 {
-    protected FirebaseService $firebaseService;
-
-    public function __construct(FirebaseService $firebaseService)
+    public function __construct(protected DeviceDataService $deviceDataService)
     {
-        $this->firebaseService = $firebaseService;
     }
 
     public function index()
@@ -25,14 +21,13 @@ class DashboardController extends Controller
     {
         $module = in_array($module, ['aquaviska', 'climeet'], true) ? $module : 'aquaviska';
         
-        // Ambil data dari Firebase
-        $rawDevicesData = $this->firebaseService->getDeviceData($module) ?? [];
+        $rawDevicesData = $this->deviceDataService->getDevicesByModule($module);
         
         $devicesData = [];
         if (is_array($rawDevicesData)) {
             foreach ($rawDevicesData as $key => $d) {
-                $isPreview = isset($d['is_preview']) && ($d['is_preview'] === true || $d['is_preview'] === 'true');
-                $isDeleted = isset($d['is_deleted']) && ($d['is_deleted'] === true || $d['is_deleted'] === 'true');
+                $isPreview = !empty($d['is_preview']);
+                $isDeleted = !empty($d['is_deleted']);
                 
                 if ($isPreview && !$isDeleted) {
                     $d['node'] = $key;
@@ -41,26 +36,23 @@ class DashboardController extends Controller
             }
         }
         
-        // Hitung statistik dari data Firebase (tanpa dummy)
         $totalDevices = count($devicesData);
         
-        // Hitung device online (status 'online' atau 'active')
         $activeDevices = count(array_filter($devicesData, function($d) {
             $status = $d['status'] ?? '';
             return in_array($status, ['online', 'active', 'normal']);
         }));
         
-        // Hitung device bermasalah
         $warningDevices = count(array_filter($devicesData, function($d) {
             $status = $d['status'] ?? '';
-            return in_array($status, ['warning', 'waspada', 'maintenance']);
+            $score = (int) ($d['condition_score'] ?? 0);
+
+            return in_array($status, ['warning', 'waspada', 'maintenance']) || ($status !== 'offline' && $score > 0 && $score < 70);
         }));
         
-        // Hitung total score untuk rata-rata
         $totalScore = array_sum(array_column($devicesData, 'condition_score')) ?: 0;
         $avgScoreAll = $totalDevices > 0 ? round($totalScore / $totalDevices) : 0;
         
-        // Data wilayah dari Firebase (real data)
         $regionsFromFirebase = [];
         foreach ($devicesData as $device) {
             if (isset($device['location']['city'])) {
@@ -109,16 +101,13 @@ class DashboardController extends Controller
             'kecepatanAngin' => 'm/s',
         ];
 
-        // Data sensor slides dari Firebase (real data)
         $sensorSlidesFromFirebase = [];
-
-        $deviceDataMonitoring = $this->firebaseService->getRawDataMonitoring($module);
         foreach ($devicesData as $device) {
             if (isset($device['location']['latitude']) && isset($device['location']['longitude'])) {
                 $sensors = [];
-                $latestData = $deviceDataMonitoring[$device['device_code'] ?? ''] ?? [];
-                // dd($latestData);
-                foreach ($latestData['latest'] as $key => $value) {
+                $latestData = $device['latest_data'] ?? [];
+
+                foreach ($latestData as $key => $value) {
                     $sensorInfo = $this->getSensorInfo($key, $value, $module);
                     if ($sensorInfo) {
                         $sensors[] = $sensorInfo;
@@ -146,11 +135,9 @@ class DashboardController extends Controller
                     'trendValue' => '+5%',
                     'unit' => $unitMapping[$key] ?? '',
                 ];
-                // dd($sensorSlidesFromFirebase[0]['sensors'] ?? []);
             }
         }
         
-        // Data device list dari Firebase
         $devicesList = [];
         foreach ($devicesData as $device) {
             $status = $device['status'] ?? 'unknown';
@@ -164,7 +151,6 @@ class DashboardController extends Controller
             ];
         }
         
-        // Data damage dari recommendation
         $damageList = [];
         foreach ($devicesData as $device) {
             if (!empty($device['recommendation'])) {
@@ -176,15 +162,12 @@ class DashboardController extends Controller
             }
         }
         
-        // Chart data dari sensor readings (real)
         $chartData = $this->getChartData($module, $devicesData);
         $chartLabels = $this->getChartLabels($chartData);
         $chartDatasets = $this->getChartDatasets($module, $devicesData, $regionsFormatted);
         
-        // AI Summary berdasarkan data real
         $aiSummary = $this->generateAiSummary($module, $avgScoreAll, $warningDevices);
         
-        // Alerts berdasarkan data real
         $alerts = $this->generateAlerts($module, $devicesData);
         
         // Gunakan data yang sudah dikumpulkan, jangan pakai dummy jika ada data real
@@ -344,7 +327,7 @@ class DashboardController extends Controller
                 $maxValue = $this->getMaxValue($sensor);
                 $percentage = min(100, max(0, ($avgValue / $maxValue) * 100));
                 $chartData[] = [
-                    'label' => ucfirst(str_replace('_', ' ', $sensor)),
+                    'label' => $this->getChartLabel($sensor),
                     'value' => round($percentage),
                 ];
             }
@@ -360,9 +343,32 @@ class DashboardController extends Controller
             'temperature' => 50,
             'do' => 10,
             'tds', 'turbidity' => 100,
-            'humidity' => 100,
-            'uv' => 15,
+            'humidity', 'kelembaban' => 100,
+            'uv', 'uvIndex' => 15,
+            'intensitasHujan', 'totalHujan' => 150,
+            'kecepatanAngin' => 30,
+            'tekanan' => 1050,
             default => 500,
+        };
+    }
+
+    private function getChartLabel(string $sensor): string
+    {
+        return match ($sensor) {
+            'ph' => 'pH',
+            'temperature' => 'Temperature',
+            'tds' => 'TDS',
+            'turbidity' => 'Turbidity',
+            'do' => 'Dissolved Oxygen',
+            'kelembaban' => 'Humidity',
+            'pm25' => 'PM2.5',
+            'pm10' => 'PM10',
+            'uvIndex' => 'UV Index',
+            'intensitasHujan' => 'Rainfall',
+            'kecepatanAngin' => 'Wind Speed',
+            'totalHujan' => 'Total Rainfall',
+            'tekanan' => 'Pressure',
+            default => ucfirst(str_replace('_', ' ', $sensor)),
         };
     }
     
@@ -415,11 +421,17 @@ class DashboardController extends Controller
             if (isset($latestData['turbidity']) && $latestData['turbidity'] > 30) {
                 $alerts[] = "🌊 Kekeruhan tinggi di {$location}";
             }
-            if (isset($latestData['uv']) && $latestData['uv'] > 8) {
-                $alerts[] = "☀️ UV tinggi di {$location} ({$latestData['uv']})";
+            if (isset($latestData['uvIndex']) && $latestData['uvIndex'] > 8) {
+                $alerts[] = "☀️ UV tinggi di {$location} ({$latestData['uvIndex']})";
             }
             if (isset($latestData['pm25']) && $latestData['pm25'] > 100) {
                 $alerts[] = "😷 Kualitas udara tidak sehat di {$location}";
+            }
+            if (isset($latestData['intensitasHujan']) && $latestData['intensitasHujan'] > 100) {
+                $alerts[] = "🌧️ Intensitas hujan tinggi di {$location}";
+            }
+            if (isset($latestData['kecepatanAngin']) && $latestData['kecepatanAngin'] > 20) {
+                $alerts[] = "💨 Kecepatan angin tinggi di {$location}";
             }
         }
         
